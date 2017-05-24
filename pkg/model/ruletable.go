@@ -510,9 +510,10 @@ func (r *RouteTable) watch() {
 	log.Info("RouteTable start watch.")
 
 	go r.doEvtReceive()
-	err := r.store.Watch(r.watchReceiveCh, r.watchStopCh)
+	go r.store.Watch(r.watchReceiveCh, r.watchStopCh)
+	// err := r.store.Watch(r.watchReceiveCh, r.watchStopCh)
 
-	log.Errorf("RouteTable watch err: %s", err)
+	// log.Errorf("RouteTable watch err: %s", err)
 }
 
 func (r *RouteTable) doEvtReceive() {

@@ -1,45 +1,83 @@
 package model
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/CodisLabs/codis/pkg/utils/log"
+	"github.com/coreos/etcd/clientv3"
+	"github.com/lunny/log"
 )
 
 var (
 	_ Register = EtcdStoreV3{}
 
-	// TICKER ticket
-	TICKER_V3 = time.Second * 3
-	// TTL timeout
-	TTL_V3 = uint64(5)
+	// LeaseTTL ttl
+	LeaseTTL int64 = 5
 )
 
 // Registry Registry clientv3
 func (e EtcdStoreV3) Registry(proxyInfo *ProxyInfo) error {
-	timer := time.NewTicker(TICKER_V3)
 
 	go func() {
 		for {
-			<-timer.C
-			log.Debug("Registry start")
-			e.doRegistry(proxyInfo)
+			if err := e.doRegister(proxyInfo); err != nil {
+				log.Error(err)
+			}
 		}
+
 	}()
+
 	return nil
 }
 
-func (e EtcdStore) doRegistry(proxyInfo *ProxyInfo) {
-	proxyInfo.Conf.Addr = util.ConvertIP(proxyInfo.Conf.Addr)
-	proxyInfo.Conf.MgrAddr = util.ConvertIP(proxyInfo.Conf.MgrAddr)
+func (e EtcdStoreV3) doRegister(proxyInfo *ProxyInfo) error {
+	lessor := clientv3.NewLease(e.cli)
+	defer lessor.Close()
 
-	key := fmt.Sprintf("%s/%s", e.proxiesDir, proxyInfo.Conf.Addr)
-	_, err := e.cli.Set(key, proxyInfo.Marshal(), TTL_V3)
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(e.cli.Ctx(), DefaultRequestTimeout)
+	leaseResp, err := lessor.Grant(ctx, LeaseTTL)
+	cancel()
+
+	if cost := time.Now().Sub(start); cost > DefaultSlowRequestTime {
+		log.Warnf("embed-ectd: lessor grants too slow, cost=<%s>", cost)
+	}
 
 	if err != nil {
-		log.ErrorError(err, "Registry fail.")
+		return err
 	}
+
+	key := fmt.Sprintf("%s/%s", e.proxiesDir, proxyInfo.Conf.Addr)
+
+	resp, err := e.txn().
+		// If(clientv3.Compare(clientv3.CreateRevision(key), "=", 0)).
+		Then(clientv3.OpPut(key, proxyInfo.Marshal(), clientv3.WithLease(clientv3.LeaseID(leaseResp.ID)))).
+		Commit()
+	if err != nil {
+		return err
+	}
+	if !resp.Succeeded {
+		return errors.New("register proxy failed")
+	}
+
+	leaseChan, err := lessor.KeepAlive(e.cli.Ctx(), clientv3.LeaseID(leaseResp.ID))
+
+	for {
+		select {
+		case _, ok := <-leaseChan:
+			if !ok {
+				log.Info("etcd: channel that keep alive for proxy lease is closed")
+				return nil
+			}
+
+			// log.Debugf("lease %v", l)
+		case <-e.cli.Ctx().Done():
+			return errors.New("etcd: server closed")
+		}
+	}
+
 }
 
 func (e EtcdStoreV3) GetProxies() ([]*ProxyInfo, error) {
